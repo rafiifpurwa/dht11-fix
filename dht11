@@ -1,18 +1,32 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <time.h>
 
 // ====== KONFIGURASI (sesuaikan dengan guide) ======
 const char* WIFI_SSID      = "CirkitWifi";
 const char* WIFI_PASS      = "";
-const char* MQTT_SERVER    = "broker.emqx.io";
-const int   MQTT_PORT      = 1883;
+
+const char* MQTT_SERVER    = "test.mosquitto.org";
+const bool  USE_TLS        = true;   // false = tes tanpa TLS (untuk Cirkit)
+const int   MQTT_PORT_TLS  = 8886;   // TLS (Let's Encrypt)
+const int   MQTT_PORT_PLAIN= 1883;   // tanpa TLS
+const char* MQTT_USER      = "";     // isi kalau broker butuh login
+const char* MQTT_PASSWORD  = "";
+
 const char* MQTT_TOPIC_PUB = "ionic/final/tim01/data";
 const char* MQTT_TOPIC_SUB = "ionic/final/tim01/cmd";
 const char* DEVICE_ID      = "esp32-tim01";
+
+// Nama measurement InfluxDB (sesuaikan dengan guide)
+const char* MEASUREMENT    = "sensor_data";
+
+// Untuk verifikasi sertifikat penuh, isi ISRG Root X1 lalu pakai setCACert()
+// const char* ROOT_CA = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n";
 
 // ====== PIN ======
 #define DHT_PIN  12
@@ -22,11 +36,13 @@ const char* DEVICE_ID      = "esp32-tim01";
 
 DHT dht(DHT_PIN, DHT_TYPE);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-WiFiClient espClient;
-PubSubClient mqtt(espClient);
+WiFiClient plainClient;
+WiFiClientSecure secureClient;
+PubSubClient mqtt;
 
 unsigned long lastPublish = 0;
 const unsigned long PUBLISH_INTERVAL = 5000;
+bool timeSynced = false;
 
 // Baca DHT dengan percobaan ulang
 bool readDHT(float &suhu, float &hum) {
@@ -52,6 +68,16 @@ void connectWiFi() {
   lcd.print("WiFi OK");
 }
 
+// Sinkron waktu (NTP), maksimal ~10 detik supaya tidak macet
+void syncTime() {
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  for (int i = 0; i < 20; i++) {
+    if (time(nullptr) > 1700000000) { timeSynced = true; break; }
+    delay(500);
+  }
+  Serial.println(timeSynced ? "Waktu NTP OK" : "NTP gagal, kirim tanpa timestamp");
+}
+
 // Callback saat ada pesan masuk (JSON)
 void onMessage(char* topic, byte* payload, unsigned int length) {
   JsonDocument doc;
@@ -68,10 +94,17 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
 void connectMQTT() {
   while (!mqtt.connected()) {
     Serial.print("Connect MQTT...");
+    lcd.clear();
+    lcd.print("Connect MQTT...");
     String clientId = String(DEVICE_ID) + "-" + String(random(0xffff), HEX);
-    if (mqtt.connect(clientId.c_str())) {
+    bool ok = (strlen(MQTT_USER) > 0)
+                ? mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)
+                : mqtt.connect(clientId.c_str());
+    if (ok) {
       Serial.println("OK");
       mqtt.subscribe(MQTT_TOPIC_SUB);
+      lcd.clear();
+      lcd.print("MQTT OK");
     } else {
       Serial.printf("gagal rc=%d, coba lagi 2 detik\n", mqtt.state());
       delay(2000);
@@ -91,7 +124,17 @@ void setup() {
   delay(2000);  // beri waktu DHT11 siap setelah dapat daya
 
   connectWiFi();
-  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  syncTime();
+
+  if (USE_TLS) {
+    secureClient.setInsecure();               // tes: tanpa verifikasi sertifikat
+    // secureClient.setCACert(ROOT_CA);       // versi aman
+    mqtt.setClient(secureClient);
+    mqtt.setServer(MQTT_SERVER, MQTT_PORT_TLS);
+  } else {
+    mqtt.setClient(plainClient);
+    mqtt.setServer(MQTT_SERVER, MQTT_PORT_PLAIN);
+  }
   mqtt.setCallback(onMessage);
 }
 
@@ -121,15 +164,18 @@ void loop() {
     lcd.setCursor(0, 1);
     lcd.printf("Lembab: %.0f %%", hum);
 
-    // Bentuk JSON lalu publish
-    JsonDocument doc;
-    doc["device"]      = DEVICE_ID;
-    doc["temperature"] = suhu;
-    doc["humidity"]    = hum;
-    doc["rssi"]        = WiFi.RSSI();
-
+    // Bentuk line protocol (InfluxDB) lalu publish
     char buffer[200];
-    serializeJson(doc, buffer);
+    if (timeSynced) {
+      unsigned long long ts = (unsigned long long)time(nullptr) * 1000000000ULL;
+      snprintf(buffer, sizeof(buffer),
+               "%s,device=%s temperature=%.1f,humidity=%.1f,rssi=%di %llu",
+               MEASUREMENT, DEVICE_ID, suhu, hum, WiFi.RSSI(), ts);
+    } else {
+      snprintf(buffer, sizeof(buffer),
+               "%s,device=%s temperature=%.1f,humidity=%.1f,rssi=%di",
+               MEASUREMENT, DEVICE_ID, suhu, hum, WiFi.RSSI());
+    }
     mqtt.publish(MQTT_TOPIC_PUB, buffer);
     Serial.println(buffer);
   }
